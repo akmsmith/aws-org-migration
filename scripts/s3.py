@@ -3,7 +3,6 @@ import json
 from botocore.exceptions import ClientError
 
 def is_cross_account_or_org_policy(statement, current_account):
-    # Check for cross-account or organization permissions in bucket policy
     if 'Principal' in statement:
         principal = statement['Principal']
         if isinstance(principal, dict):
@@ -16,7 +15,6 @@ def is_cross_account_or_org_policy(statement, current_account):
                 if f":{current_account}:" not in aws_principal:
                     return True
         elif principal == "*":
-            # Public, not cross-account, skip
             return False
     if 'Condition' in statement:
         condition = statement['Condition']
@@ -43,6 +41,16 @@ def is_cross_account_acl(grants, current_owner_id):
                 findings.append(f"Group: {uri}")
     return findings
 
+def get_bucket_region(s3_client, bucket_name):
+    try:
+        response = s3_client.get_bucket_location(Bucket=bucket_name)
+        loc = response.get('LocationConstraint')
+        # For us-east-1, LocationConstraint is None
+        return loc if loc else 'us-east-1'
+    except Exception as e:
+        print(f"  Error getting region for bucket {bucket_name}: {e}")
+        return None
+
 def main():
     s3 = boto3.client('s3')
     sts = boto3.client('sts')
@@ -57,9 +65,17 @@ def main():
         bucket_name = bucket['Name']
         bucket_findings = []
 
+        # Get the bucket's region
+        bucket_region = get_bucket_region(s3, bucket_name)
+        if not bucket_region:
+            continue
+
+        # Use a region-specific client for all operations
+        region_s3 = boto3.client('s3', region_name=bucket_region)
+
         # Check bucket policy
         try:
-            policy_str = s3.get_bucket_policy(Bucket=bucket_name)['Policy']
+            policy_str = region_s3.get_bucket_policy(Bucket=bucket_name)['Policy']
             policy = json.loads(policy_str)
             for statement in policy.get('Statement', []):
                 if is_cross_account_or_org_policy(statement, current_account):
@@ -71,7 +87,7 @@ def main():
 
         # Check bucket ACL
         try:
-            acl = s3.get_bucket_acl(Bucket=bucket_name)
+            acl = region_s3.get_bucket_acl(Bucket=bucket_name)
             findings = is_cross_account_acl(acl['Grants'], acl['Owner']['ID'])
             if findings:
                 bucket_findings.append("  [!] Cross-account or group permissions in bucket ACL:\n" +
@@ -81,12 +97,12 @@ def main():
 
         # Check object ACLs (sampled: first 1000 objects)
         try:
-            paginator = s3.get_paginator('list_objects_v2')
+            paginator = region_s3.get_paginator('list_objects_v2')
             for page in paginator.paginate(Bucket=bucket_name, PaginationConfig={'MaxItems': 1000}):
                 for obj in page.get('Contents', []):
                     key = obj['Key']
                     try:
-                        obj_acl = s3.get_object_acl(Bucket=bucket_name, Key=key)
+                        obj_acl = region_s3.get_object_acl(Bucket=bucket_name, Key=key)
                         obj_findings = is_cross_account_acl(obj_acl['Grants'], obj_acl['Owner']['ID'])
                         if obj_findings:
                             bucket_findings.append(
@@ -101,7 +117,7 @@ def main():
 
         if bucket_findings:
             findings_found = True
-            print(f"\nBucket: {bucket_name}")
+            print(f"\nBucket: {bucket_name} (Region: {bucket_region})")
             for finding in bucket_findings:
                 print(finding)
 
